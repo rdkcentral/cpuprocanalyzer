@@ -1,3 +1,22 @@
+##########################################################################
+# If not stated otherwise in this file or this component's "LICENSE"
+# file the following copyright and licenses apply:
+#
+# Copyright 2018 RDK Management
+#
+# Licensed under the Apache License, Version 2.0 (the "LICENSE");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+##########################################################################
+
 #!/bin/sh
 
 source /etc/device.properties
@@ -34,11 +53,7 @@ arg_val=$1
 NeedUpload=$2
 case $arg_val in
         start)
-            if [ "$BOX_TYPE" = "XB3" ]; then
-                 nice -n 19 /usr/bin/cpuprocanalyzer
-            else
-                 touch /tmp/PROC_ANALYZER_ENABLE
-            fi
+            touch /tmp/PROC_ANALYZER_ENABLE
             exit 0
         ;;
         stop)
@@ -56,9 +71,6 @@ case $arg_val in
             fi
 
             rm -rf /tmp/cpuprocanalyzer
-            if [ "$BOX_TYPE" != "XB3" ]; then
-                 rm -rf /tmp/PROC_ANALYZER_ENABLE
-            fi
 
 	    if [ "$NeedUpload" -eq 1 ]; then
                  rm -rf /tmp/$dt

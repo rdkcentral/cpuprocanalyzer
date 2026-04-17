@@ -1,10 +1,10 @@
 ########################################################################
-# If not stated otherwise in this file or this component's Licenses.txt
+# If not stated otherwise in this file or this component's "LICENSE"
 # file the following copyright and licenses apply:
 #
 # Copyright 2018 RDK Management
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
+# Licensed under the Apache License, Version 2.0 (the "LICENSE");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
