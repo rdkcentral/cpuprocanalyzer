@@ -17,16 +17,28 @@
 # limitations under the License.
 ##########################################################################
 
-SUBDIRS =
-bin_PROGRAMS = cpuprocanalyzer
+bin_PROGRAMS = cpuprocanalyzer memtraced memory_grower
+
+memtraced_CFLAGS = -Wall -Werror -I$(PKG_CONFIG_SYSROOT_DIR)${includedir}/ -I${PKG_CONFIG_SYSROOT_DIR}$(includedir)/rbus -I${PKG_CONFIG_SYSROOT_DIR}$(includedir)/ccsp
+
 cpuprocanalyzer_SOURCES = cpuproc_analyzer.cpp
+memtraced_SOURCES = MemTrace.c MemTrace_log.c MemTrace_rbus.c
+memory_grower_SOURCES = memory_grower.c
+
+memtraced_LDFLAGS = -lpthread -lrdkloggers -lsyscfg -lrbus -lccsp_common
+memory_grower_LDFLAGS = -lpthread
+
+
+lib_LTLIBRARIES = libmtrace_watcher.la
+libmtrace_watcher_la_SOURCES = mtrace_watcher.c
+libmtrace_watcher_la_LDFLAGS = -shared -fPIC -lev -lpthread
 
 
 if PROCANALYZER_EXTENDER
 AM_LDFLAGS = -lpthread
 AM_CXXFLAGS = -DPROCANALYZER_EXTENDER
 else
-AM_LDFLAGS = -lpthread -lrdkloggers 
+AM_LDFLAGS = -lpthread -lrdkloggers
 
 if PROCANALYZER_BROADBAND
 AM_LDFLAGS += -ltelemetry_msgsender -ljson-c
