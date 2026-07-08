@@ -5,7 +5,6 @@
 #include <ev.h>
 #include <mcheck.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <string.h>
 #include <ctype.h>
 #include <malloc.h>
@@ -28,7 +27,6 @@
 static bool log_fp_initialized = false;
 static FILE *mtrace_log_fp = NULL;
 static bool tracing_started = false;
-static bool lib_inited = false;
 
 // Function to check if we can still log (file size control)
 static int can_log_more(FILE *fp) {
@@ -268,121 +266,179 @@ static void heap_trim_cb(EV_P_ ev_stat *w, int revents) {
     }
 }
 
-static void* mtrace_watcher_thread(void* arg) {
-    UNUSED_PARAMETER(arg);
-    pthread_detach(pthread_self());
+static ev_stat  s_mtrace_watcher;
+static ev_stat  s_heaptrim_watcher;
+static ev_timer s_size_check_timer;
+static char     s_mtrace_watcher_filename[192];
+static char     s_heaptrim_filename[280];
+static bool     s_watcher_initialized = false;
+static pid_t    s_watcher_pid = 0;
+
+/*
+ * mtrace_watcher_init - Register all mtrace watchers onto an existing ev_loop.
+ *
+ * Replaces the former mtrace_watcher_thread().  The caller owns the loop and
+ * drives it with ev_run(); no additional thread is created here.  Call this
+ * once after the process has daemonized (getppid() == 1).
+ *
+ * Returns  0 on success.
+ * Returns -1 if loop is NULL.
+ */
+int mtrace_watcher_init(struct ev_loop *loop)
+{
     MTRACE_LOG("Inside %s\n", __FUNCTION__);
-    MTRACE_LOG("Starting mtrace watcher thread\n");
-    struct ev_loop *loop = ev_loop_new(0);
-    ev_stat mtrace_watcher;
-    ev_stat heaptrim_watcher;
-    ev_timer size_check_timer;
 
-    char mtrace_watcher_filename[192];
-    snprintf(mtrace_watcher_filename, sizeof(mtrace_watcher_filename), "/tmp/mtrace_%d", getpid());
+    if (!loop) {
+        MTRACE_LOG("mtrace_watcher_init: NULL loop\n");
+        return -1;
+    }
 
-    ev_stat_init(&mtrace_watcher, mtrace_cb, mtrace_watcher_filename, 0.);
-    ev_stat_start(loop, &mtrace_watcher);
+    /* Reset after fork so each child gets its own watchers. */
+    if (s_watcher_pid != getpid()) {
+        s_watcher_pid         = getpid();
+        s_watcher_initialized = false;
+    }
 
-    // Setup periodic timer to check file size every 10 seconds
-    ev_timer_init(&size_check_timer, size_check_timer_cb, 10.0, 10.0);
-    ev_timer_start(loop, &size_check_timer);
+    if (s_watcher_initialized) {
+        MTRACE_LOG("mtrace_watcher_init: already initialized for pid %d, skipping\n", getpid());
+        return 0;
+    }
+
+    MTRACE_LOG("Starting mtrace watcher (API mode) for pid %d\n", getpid());
+
+    /* Marker-file watcher: presence of /tmp/mtrace_<pid> starts tracing */
+    snprintf(s_mtrace_watcher_filename, sizeof(s_mtrace_watcher_filename),
+             "/tmp/mtrace_%d", getpid());
+    ev_stat_init(&s_mtrace_watcher, mtrace_cb, s_mtrace_watcher_filename, 0.);
+    ev_stat_start(loop, &s_mtrace_watcher);
+
+    /* Periodic timer: check mtrace log file size every 10 seconds */
+    ev_timer_init(&s_size_check_timer, size_check_timer_cb, 10.0, 10.0);
+    ev_timer_start(loop, &s_size_check_timer);
     MTRACE_LOG("Started periodic size check timer (every 10 seconds)\n");
 
-    // Setup heap trim filename
+    /* Heap-trim watcher: touching /tmp/heaptrim_<name>.flag dumps heap info */
     char proc_name[256];
     get_process_basename(proc_name, sizeof(proc_name));
     to_lower(proc_name);
-    char heaptrim_filename[280];
-    snprintf(heaptrim_filename, sizeof(heaptrim_filename), "/tmp/heaptrim_%s.flag", proc_name);
-    int fd = open(heaptrim_filename, O_CREAT | O_RDWR, 0644);
+    snprintf(s_heaptrim_filename, sizeof(s_heaptrim_filename),
+             "/tmp/heaptrim_%s.flag", proc_name);
+    int fd = open(s_heaptrim_filename, O_CREAT | O_RDWR, 0644);
     if (fd >= 0) close(fd);
-    ev_stat_init(&heaptrim_watcher, heap_trim_cb, heaptrim_filename, 0.);
-    ev_stat_start(loop, &heaptrim_watcher);
+    ev_stat_init(&s_heaptrim_watcher, heap_trim_cb, s_heaptrim_filename, 0.);
+    ev_stat_start(loop, &s_heaptrim_watcher);
 
-    ev_run(loop, 0);
-    ev_loop_destroy(loop);
-    return NULL;
+    s_watcher_initialized = true;
+    MTRACE_LOG("mtrace_watcher_init: all watchers registered on loop %p\n", (void *)loop);
+    return 0;
 }
 
-static pthread_t watcher_thread;
-static pthread_t watcher_wait_thread;
-static bool watcher_thread_requested = false;
-static pid_t watcher_state_pid = 0;
-
-static void* wait_for_daemon_and_start_watcher(void* arg) {
-    UNUSED_PARAMETER(arg);
-    pthread_detach(pthread_self());
+/*
+ * mtrace_watcher_cleanup - Stop and detach all watchers from the loop.
+ *
+ * Call before ev_loop_destroy() on controlled shutdown.  Safe to call even
+ * if mtrace_watcher_init() was never invoked.
+ */
+void mtrace_watcher_cleanup(struct ev_loop *loop)
+{
     MTRACE_LOG("Inside %s\n", __FUNCTION__);
-
-    while (1) {
-        pid_t ppid = getppid();
-        if (ppid == 1) {
-            MTRACE_LOG("Process is daemonized (ppid=1), creating mtrace watcher thread\n");
-            break;
-        }
-        MTRACE_LOG("Process has parent (ppid=%d), waiting for daemonization...\n", ppid);
-        sleep(5);
-    }
-
-    int rc = pthread_create(&watcher_thread, NULL, mtrace_watcher_thread, NULL);
-    if (rc == 0) {
-        pthread_setname_np(watcher_thread, "mtrace_watcher");
-    } else {
-        MTRACE_LOG("Error: pthread_create failed (rc=%d)\n", rc);
-    }
-    return NULL;
+    if (!loop || !s_watcher_initialized) return;
+    ev_stat_stop(loop,  &s_mtrace_watcher);
+    ev_timer_stop(loop, &s_size_check_timer);
+    ev_stat_stop(loop,  &s_heaptrim_watcher);
+    s_watcher_initialized = false;
+    MTRACE_LOG("mtrace_watcher_cleanup: watchers removed from loop %p\n", (void *)loop);
 }
 
-void mtrace_watcher_once(void) {
+/* ======================================================================
+ * Self-contained common API
+ * The loop is owned internally; callers do not need to know about libev.
+ * ====================================================================== */
+
+static struct ev_loop *s_owned_loop = NULL;
+
+/*
+ * mtrace_watcher_start - Create an internal ev_loop and register all watchers.
+ *
+ * Call once after daemonization.  Pair with mtrace_watcher_run() or
+ * mtrace_watcher_tick() to drive the loop.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int mtrace_watcher_start(void)
+{
     MTRACE_LOG("Inside %s\n", __FUNCTION__);
-
-    // Reset per-process scheduling state after fork.
-    if (watcher_state_pid != getpid()) {
-        watcher_state_pid = getpid();
-        watcher_thread_requested = false;
+    if (s_owned_loop) {
+        MTRACE_LOG("mtrace_watcher_start: already started for pid %d\n", getpid());
+        return 0;
     }
+    s_owned_loop = ev_loop_new(EVFLAG_AUTO);
+    if (!s_owned_loop) {
+        MTRACE_LOG("mtrace_watcher_start: ev_loop_new failed\n");
+        return -1;
+    }
+    int rc = mtrace_watcher_init(s_owned_loop);
+    if (rc != 0) {
+        ev_loop_destroy(s_owned_loop);
+        s_owned_loop = NULL;
+    }
+    return rc;
+}
 
-    if (watcher_thread_requested) {
-        MTRACE_LOG("Watcher start already requested for pid %d, skipping duplicate request\n", getpid());
+/*
+ * mtrace_watcher_run - Block and drive the watcher loop until the process exits.
+ *
+ * Replaces a component's  while(1) { sleep(N); }  blocking loop.
+ * Calls mtrace_watcher_stop() automatically before returning.
+ */
+void mtrace_watcher_run(void)
+{
+    MTRACE_LOG("Inside %s\n", __FUNCTION__);
+    if (!s_owned_loop) {
+        MTRACE_LOG("mtrace_watcher_run: not started; call mtrace_watcher_start() first\n");
+        /* Fallback: keep the process alive without watchers */
+        while (1) { sleep(30); }
         return;
     }
-
-    watcher_thread_requested = true;
-    int rc = pthread_create(&watcher_wait_thread, NULL, wait_for_daemon_and_start_watcher, NULL);
-    if (rc == 0) {
-        pthread_setname_np(watcher_wait_thread, "mtrace_waiter");
-        MTRACE_LOG("Started non-blocking daemon wait thread for pid %d\n", getpid());
-    } else {
-        watcher_thread_requested = false;
-        MTRACE_LOG("Error: pthread_create failed (rc=%d)\n", rc);
-    }
+    MTRACE_LOG("mtrace_watcher_run: entering ev_run\n");
+    ev_run(s_owned_loop, 0);
+    mtrace_watcher_stop();
 }
 
+/*
+ * mtrace_watcher_tick - Non-blocking single-pass dispatch.
+ *
+ * For components that already have their own main loop.  Call once per
+ * iteration so the mtrace watchers get CPU time without blocking.
+ *
+ * Example:
+ *   while (running) {
+ *       mtrace_watcher_tick();
+ *       // ... component work ...
+ *       sleep(1);
+ *   }
+ */
+void mtrace_watcher_tick(void)
+{
+    if (!s_owned_loop) return;
+    ev_run(s_owned_loop, EVRUN_NOWAIT);
+}
 
-__attribute__((constructor))
-void init_library() {
-    const char *trace_file = getenv("RDKB_MTRACE_LOGFILE");
-    if (!trace_file) {
-        setenv("RDKB_MTRACE_LOGFILE", "/tmp/mtrace_watcher_log.txt", 1);
-    }
+/*
+ * mtrace_watcher_stop - Stop all watchers and destroy the internal loop.
+ *
+ * Safe to call even if mtrace_watcher_start() was never invoked.
+ */
+void mtrace_watcher_stop(void)
+{
     MTRACE_LOG("Inside %s\n", __FUNCTION__);
-    MTRACE_LOG("Library initialized for PID %d\n", getpid());
-    if (!lib_inited) {
-        lib_inited = true;
-        if (!tracing_started) {
-            MTRACE_LOG("Starting watcher thread\n");
-            mtrace_watcher_once();
-        }
-        pthread_atfork(NULL, NULL, mtrace_watcher_once);
-    }
+    if (!s_owned_loop) return;
+    ev_break(s_owned_loop, EVBREAK_ALL);
+    mtrace_watcher_cleanup(s_owned_loop);
+    ev_loop_destroy(s_owned_loop);
+    s_owned_loop = NULL;
+    MTRACE_LOG("mtrace_watcher_stop: loop destroyed\n");
 }
 
-__attribute__((destructor))
-static void fini_library(void) {
-    MTRACE_LOG("Inside %s\n", __FUNCTION__);
-    if (tracing_started) {
-        MTRACE_LOG("Finalizing library; calling muntrace() for pid %d\n", getpid());
-        muntrace();
-    }
-}
+
+
